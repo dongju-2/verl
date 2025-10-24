@@ -26,3 +26,5 @@ algorithm:
 
 trainer:
   project_name: verl-dapo
+  dapo_ds_metric_category_key: data_source  # 'category', 'ability', etc in dataset columns
+  ds_metric_category_map: null  # null=no mapping, else, i.e) {"dapo_math": "math", "numina_amc_aime": "math", "codeforces": "code"}

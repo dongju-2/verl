@@ -18,8 +18,9 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import os
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from copy import deepcopy
+from itertools import zip_longest
 from pprint import pprint
 
 import numpy as np
@@ -131,6 +132,10 @@ class RayDAPOTrainer(RayPPOTrainer):
         batch = None
         num_prompt_in_batch = 0
         num_gen_batches = 0
+        category2num_prompt = Counter()
+        category2num_fail_by = defaultdict(lambda: Counter())
+        categories = []  # actual training batch.
+
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics = {}
@@ -251,20 +256,35 @@ class RayDAPOTrainer(RayPPOTrainer):
 
                         # Collect the sequence reward for each trajectory
                         prompt_uid2metric_vals = defaultdict(list)
-                        for uid, metric_val in zip(
-                            new_batch.non_tensor_batch["uid"], new_batch.non_tensor_batch[metric_name], strict=True
+                        prompt_uid2category = {}
+                        for uid, metric_val, category in zip_longest(
+                            new_batch.non_tensor_batch["uid"],
+                            new_batch.non_tensor_batch[metric_name],
+                            new_batch.non_tensor_batch.get(self.config.trainer.dapo_ds_metric_category_key, []),
+                            fillvalue=None,
                         ):
                             prompt_uid2metric_vals[uid].append(metric_val)
+                            if self.config.trainer.ds_metric_category_map:
+                                category = self.config.trainer.ds_metric_category_map.get(category, "others")
+                            prompt_uid2category[uid] = category
 
-                        prompt_uid2metric_std = {}
+                        kept_prompt_uids = []
                         for prompt_uid, metric_vals in prompt_uid2metric_vals.items():
-                            prompt_uid2metric_std[prompt_uid] = np.std(metric_vals)
+                            category = prompt_uid2category[prompt_uid]
+                            category2num_prompt[category] += 1
+                            std = np.std(metric_vals)
+                            if std > 0 or len(metric_vals) == 1:
+                                kept_prompt_uids.append(prompt_uid)
+                                categories.append(category)
+                            else:
+                                val = metric_vals[0]
+                                if isinstance(val, bool):  # don't distinguish int and bool here
+                                    val = int(val)
+                                if isinstance(val, float):
+                                    # Prevent the number of metrics from increasing too much due to decimal points.
+                                    val = int(val) if val.is_integer() else round(val, 1)
+                                category2num_fail_by[category][val] += 1
 
-                        kept_prompt_uids = [
-                            uid
-                            for uid, std in prompt_uid2metric_std.items()
-                            if std > 0 or len(prompt_uid2metric_vals[uid]) == 1
-                        ]
                         num_prompt_in_batch += len(kept_prompt_uids)
 
                         kept_traj_idxs = []
@@ -294,6 +314,9 @@ class RayDAPOTrainer(RayPPOTrainer):
                             # Align the batch
                             traj_bsz = self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n
                             batch = batch[:traj_bsz]
+
+                            # actual used categories in batch
+                            categories = categories[: self.config.data.train_batch_size]
 
                     # === Updating ===
                     # Balance the number of valid tokens across DP ranks.
@@ -398,9 +421,40 @@ class RayDAPOTrainer(RayPPOTrainer):
                 timing_raw = defaultdict(float)  # clear timing
 
                 metrics["train/num_gen_batches"] = num_gen_batches
+
+                # This metric shows how successfully sampling occurs during training (std > 0)
+                # and how sampling failures vary depending on certain values.
+
+                if self.config.algorithm.filter_groups.enable:
+                    gen_bsz = sum(category2num_prompt.values())
+                    _write_sampling_metric(
+                        metrics,
+                        gen_bsz,
+                        sum(category2num_fail_by.values(), start=Counter()),
+                    )
+                    if len(category2num_prompt) > 1:
+                        # add only if multiple categories exsist.
+                        for category, fail_by in category2num_fail_by.items():
+                            _write_sampling_metric(
+                                metrics,
+                                category2num_prompt[category],
+                                fail_by,
+                                category=category,
+                            )
+
+                        for category, count in category2num_prompt.items():
+                            metrics[f"train/gen_batch_category_ratio/{category}"] = count / gen_bsz
+
+                        train_bsz = len(categories)
+                        for category, count in Counter(categories).items():
+                            metrics[f"train/train_batch_category_ratio/{category}"] = count / train_bsz
+
                 batch = None
                 num_prompt_in_batch = 0
                 num_gen_batches = 0
+                category2num_prompt = Counter()
+                category2num_fail_by = defaultdict(lambda: Counter())
+                categories = []
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
@@ -422,3 +476,11 @@ class RayDAPOTrainer(RayPPOTrainer):
                 self._save_checkpoint()
             metrics = {f"timing/{k}": v for k, v in timing_raw.items()}
             logger.log(data=metrics, step=self.global_steps)
+
+
+def _write_sampling_metric(metrics, num_gen_prompt, fail_by, category=""):
+    if category:
+        category = f"/{category}"
+    metrics[f"train/dynamic_sampling_pass{category}"] = 1.0 - sum(fail_by.values()) / num_gen_prompt
+    for val in sorted(fail_by, reverse=True):  # higher value first.
+        metrics[f"train/dynamic_sampling_fail{category}/all_value_{val}"] = fail_by[val] / num_gen_prompt
