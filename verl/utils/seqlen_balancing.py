@@ -266,6 +266,8 @@ def rearrange_micro_batches(
     same_micro_num_in_dp=True,
     min_num_micro_batch=None,
     use_dynamic_bsz_balance=True,
+    max_token_len_scale=0.8,
+    num_micro_batch_buffer=1,
 ):
     """
     Split a batch into micro-batches by total token count, with optional DP sync and padding.
@@ -278,7 +280,9 @@ def rearrange_micro_batches(
         same_micro_num_in_dp (bool): if True and dp_group set, pad all ranks to the same count.
         min_num_micro_batch (int, optional): force at least this many splits (pads empty ones).
         use_dynamic_bsz_balance (bool, optional): balance the computational workload between micro-batches
-
+        max_token_len_scale (float, optional): Scales down `max_token_len` to enforce
+            a more conservative limit (prevent potential OOM).
+        num_micro_batch_buffer (int, optional): Additional micro-batches used as a safety buffer (prevent potential OOM)
     Returns:
         List[TensorDict]: the micro-batches.
         List[List[int]]: index lists mapping each micro-batch back to original positions.
@@ -297,6 +301,8 @@ def rearrange_micro_batches(
     )
     total_seqlen = seq_len_effective.sum().item()
     # NOTE: num_microbatches <= batch_size, so take the min of this two.
+    if max_token_len_scale is not None:
+        max_token_len = max(1, int(max_token_len * max_token_len_scale))
     num_micro_batches = min(len(seq_len_effective), ceildiv(total_seqlen, max_token_len))
     if min_num_micro_batch is not None:
         # used to support pp
@@ -307,7 +313,10 @@ def rearrange_micro_batches(
         num_micro_batches = num_micro_batches.cpu().item()
     if num_batches_divided_by is not None:
         num_micro_batches = roundup_divisible(num_micro_batches, num_batches_divided_by)
+    if num_micro_batch_buffer is not None:
+        num_micro_batches += num_micro_batch_buffer
 
+    num_micro_batches = min(len(seq_len_effective), num_micro_batches)
     assert num_micro_batches <= len(seq_len_effective)
 
     workloads = calculate_workload(seq_len_effective)
